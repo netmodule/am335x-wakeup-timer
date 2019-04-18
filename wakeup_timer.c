@@ -7,9 +7,9 @@
 #include <linux/clk.h>
 #include <linux/interrupt.h>
 #include <linux/timekeeping.h>
+#include <linux/platform_data/dmtimer-omap.h>
+#include <clocksource/timer-ti-dm.h>
 
-
-#include "dmtimer.h"
 
 struct wakeup_timer_priv {
 	struct omap_dm_timer *timer;
@@ -20,17 +20,18 @@ struct wakeup_timer_priv {
 	struct timespec64 suspend_time;
 
 	struct platform_device *pdev;
+	const struct omap_dm_timer_ops *timer_ops;
 };
 
 static irqreturn_t omap_gpio_irq_handler(int irq, void *data)
 {
 	struct wakeup_timer_priv *priv = data;
 	struct omap_dm_timer *timer = priv->timer;
-	unsigned int status = omap_dm_timer_read_status(timer);
+	unsigned int status = priv->timer_ops->read_status(timer);
 
-	omap_dm_timer_write_status(timer, status);
-	omap_dm_timer_write_counter(timer, 0);
-	omap_dm_timer_set_int_disable(timer, 2);
+	priv->timer_ops->write_status(timer, status);
+	priv->timer_ops->write_counter(timer, 0);
+	priv->timer_ops->set_int_disable(timer, 2);
 
 	pm_wakeup_event(&priv->pdev->dev, 0);
 
@@ -65,10 +66,10 @@ static int start_timer(struct wakeup_timer_priv *priv)
 
 	priv->load_register = load;
 
-	omap_dm_timer_set_int_enable(timer, 2);
+	priv->timer_ops->set_int_enable(timer, 2);
 
 	printk(KERN_INFO "Set load register to: 0x%08X\n", load);
-	omap_dm_timer_set_load_start(timer, 0, load);
+	priv->timer_ops->set_load(timer, 0, load);
 
 	return 0;
 
@@ -147,9 +148,9 @@ static int wakeup_timer_probe(struct platform_device *pdev)
 	struct omap_dm_timer *timer;
 	struct clk *timer_clk;
 	unsigned int rate;
-	struct device_node *timer_np;
 	struct device_node *np;
 	int ret;
+	struct dmtimer_platform_data * pdata;
 
 	dev_info(&pdev->dev, "%s\n", __func__);
 
@@ -164,41 +165,34 @@ static int wakeup_timer_probe(struct platform_device *pdev)
 		return -EINVAL;
 	}
 
-	timer_np = of_parse_phandle(np, "timer", 0);
-	if (timer_np != NULL) {
-		dev_info(&pdev->dev, "Request timer by node\n");
-		timer = omap_dm_timer_request_by_node(timer_np);
-		if (timer == NULL) {
-			return -EBUSY;
-		}
-	}
-	else {
-		dev_info(&pdev->dev, "Request any free timer\n");
-		timer = omap_dm_timer_request();
-		if (timer == NULL) {
-			return -EBUSY;
-		}
+	dev_info(&pdev->dev, "Request any free timer\n");
+	timer = omap_dm_timer_request_by_cap(0);
+	if (timer == NULL) {
+		return -EBUSY;
 	}
 
 	wakeup_timer->timer = timer;
 	wakeup_timer->pdev = pdev;
 	wakeup_timer->sleep_time_ms = 2000;
 	wakeup_timer->load_register= 0;
+	
+	pdata = timer->pdev->dev.platform_data;
+	wakeup_timer->timer_ops = pdata->timer_ops;
 
-	omap_dm_timer_set_source(timer, OMAP_TIMER_SRC_SYS_CLK);
+	wakeup_timer->timer_ops->set_source(timer, OMAP_TIMER_SRC_SYS_CLK);
 
-	timer_clk = omap_dm_timer_get_fclk(timer);
+	timer_clk = wakeup_timer->timer_ops->get_fclk(timer);
 
 	rate = clk_get_rate(timer_clk);
 	dev_info(&pdev->dev, "timer rate %d\n", rate);
 	switch (rate) {
 		case 25000000:
 			/* Clock is 97656 kHz */
-			omap_dm_timer_set_prescaler(timer, 7);
+			wakeup_timer->timer_ops->set_prescaler(timer, 7);
 			wakeup_timer->freq_hz = 97656;
 			break;
 		case 32786:
-			omap_dm_timer_set_prescaler(timer, 1);
+			wakeup_timer->timer_ops->set_prescaler(timer, 1);
 			wakeup_timer->freq_hz = 16393;
 			break;
 		default:
@@ -209,7 +203,7 @@ static int wakeup_timer_probe(struct platform_device *pdev)
 	}
 
 
-	wakeup_timer->irq = omap_dm_timer_get_irq(timer);
+	wakeup_timer->irq = wakeup_timer->timer_ops->get_irq(timer);
 	if (wakeup_timer->irq <= 0) {
 		dev_err(&pdev->dev, "Timer does not have a valid irq\n");
 		goto error;
@@ -236,7 +230,7 @@ static int wakeup_timer_probe(struct platform_device *pdev)
 
 error:
 	if (timer) {
-		omap_dm_timer_free(timer);
+		wakeup_timer->timer_ops->free(timer);
 		timer = NULL;
 	}
 
@@ -255,7 +249,7 @@ static int __exit wakeup_timer_remove(struct platform_device *pdev)
 
 	devm_free_irq(&pdev->dev, wakeup_timer->irq, wakeup_timer);
 
-	omap_dm_timer_free(wakeup_timer->timer);
+	wakeup_timer->timer_ops->free(wakeup_timer->timer);
 
 	devm_kfree(&pdev->dev, wakeup_timer);
 
@@ -280,7 +274,7 @@ static inline void correct_time(struct device *dev,
 	struct timespec64 diff_time, new_time;
 	unsigned int timer_diff, timer_counter;
 
-	timer_counter = omap_dm_timer_read_counter(priv->timer);
+	timer_counter = priv->timer_ops->read_counter(priv->timer);
 	timer_diff = (timer_counter - 1) - priv->load_register;
 	diff_time.tv_sec = timer_diff/priv->freq_hz;
 	/* We only correct ms because we have to take care of 32 bit.
